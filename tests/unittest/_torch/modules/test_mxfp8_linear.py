@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -594,6 +595,106 @@ def test_mxfp8_rejects_unknown_backend(monkeypatch):
     monkeypatch.setenv("TRTLLM_MXFP8_GEMM_BACKEND", "unknown")
     with pytest.raises(ValueError, match="TRTLLM_MXFP8_GEMM_BACKEND"):
         MXFP8LinearMethod()
+
+
+def _mock_triton_matmul(monkeypatch: pytest.MonkeyPatch, output: torch.Tensor) -> tuple[Mock, list]:
+    """Replace the Triton matmul entry points and record the opt-flag constraints in effect."""
+    constraints = []
+
+    @contextmanager
+    def record_constraints(flags):
+        constraints.append(flags)
+        yield
+
+    matmul = Mock(return_value=output)
+    monkeypatch.setattr("triton_kernels.matmul.matmul", matmul)
+    monkeypatch.setattr("triton_kernels.matmul.scoped_opt_flags_constraints", record_constraints)
+    return matmul, constraints
+
+
+def _hopper_mxfp8_method(monkeypatch: pytest.MonkeyPatch) -> MXFP8LinearMethod:
+    monkeypatch.delenv("TRTLLM_MXFP8_GEMM_BACKEND", raising=False)
+    monkeypatch.setattr(linear_module, "_mxfp8_cutlass_op_available", lambda: False)
+    monkeypatch.setattr(linear_module, "_mxfp8_flashinfer_only", lambda: False)
+    monkeypatch.setattr(linear_module, "_mxfp8_triton_supported", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    return MXFP8LinearMethod()
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("cuda_available", "sm_version", "expected"),
+    [(True, 90, True), (True, 89, False), (True, 100, False), (False, 90, False)],
+)
+def test_mxfp8_triton_runs_on_hopper_only(
+    monkeypatch: pytest.MonkeyPatch, cuda_available: bool, sm_version: int, expected: bool
+) -> None:
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: cuda_available)
+    monkeypatch.setattr(linear_module, "get_sm_version", lambda: sm_version)
+    assert linear_module._mxfp8_triton_supported() is expected
+
+
+@pytest.mark.cpu_only
+def test_mxfp8_triton_call_contract(monkeypatch: pytest.MonkeyPatch) -> None:
+    method = _hopper_mxfp8_method(monkeypatch)
+    assert method.use_triton
+    output = torch.ones((2, 3), dtype=torch.bfloat16)
+    matmul, constraints = _mock_triton_matmul(monkeypatch, output)
+    module = SimpleNamespace(
+        weight=torch.empty((3, 64), dtype=torch.float8_e4m3fn),
+        weight_scale=torch.empty((3, 2), dtype=torch.uint8),
+        dtype=torch.bfloat16,
+    )
+    input = torch.empty((2, 64), dtype=torch.bfloat16)
+    bias = torch.full((3,), 2.0, dtype=torch.bfloat16)
+
+    result = method.apply(module, input, bias)
+
+    matmul.assert_called_once()
+    args, kwargs = matmul.call_args
+    assert args[0] is input and args[2] is None
+    assert args[1].shape == (1, 64, 3)
+    config = kwargs["precision_config"]
+    assert config.b_mx_scale.shape == (1, 2, 3)
+    assert config.b_microblock_size == 32
+    assert config.out_dtype == torch.bfloat16
+    assert constraints == [linear_module._MXFP8_TRITON_OPT_FLAGS]
+    assert constraints[0]["block_k"] % 32 == 0
+    assert torch.equal(result, output + bias)
+
+
+@pytest.mark.cpu_only
+@pytest.mark.parametrize(
+    ("capturing", "compiling", "dtype", "num_tokens"),
+    [
+        (False, False, torch.bfloat16, 2),
+        (True, True, torch.bfloat16, 2),
+        (True, False, torch.float32, 2),
+        (True, False, torch.bfloat16, MXFP8LinearMethod._TRITON_MAX_TOKENS + 1),
+    ],
+    ids=["eager", "compiling", "fp32", "above_token_limit"],
+)
+def test_mxfp8_triton_falls_back_to_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    capturing: bool,
+    compiling: bool,
+    dtype: torch.dtype,
+    num_tokens: int,
+) -> None:
+    method = _hopper_mxfp8_method(monkeypatch)
+    matmul, _ = _mock_triton_matmul(monkeypatch, torch.empty(0))
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: capturing)
+    monkeypatch.setattr(linear_module, "is_torch_compiling", lambda: compiling)
+    w = torch.randn(3, 64, dtype=torch.bfloat16)
+    w_e4m3, scale = quant_bf16_to_mxfp8(w, 32)
+    module = SimpleNamespace(weight=w_e4m3, weight_scale=scale, dtype=torch.bfloat16)
+    x = torch.randn(num_tokens, 64, dtype=dtype)
+
+    result = method.apply(module, x, None)
+
+    matmul.assert_not_called()
+    ref = x @ dequant_mxfp8_weight(w_e4m3, scale, 32).to(dtype).T
+    assert torch.equal(result, ref)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="MXFP8 Linear load path requires CUDA")

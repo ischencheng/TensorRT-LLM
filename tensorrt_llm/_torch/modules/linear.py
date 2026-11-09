@@ -3543,6 +3543,21 @@ def _mxfp8_flashinfer_only() -> bool:
             and not is_sm_100f())
 
 
+def _mxfp8_triton_supported() -> bool:
+    """Hopper runs BF16 activations x MXFP8 weights through the Triton matmul kernel."""
+    return torch.cuda.is_available() and get_sm_version() == 90
+
+
+# ``matmul`` picks 2 warps below M = 17, too few for the per-tile FP8 upcast. Persistent kernels
+# need the scale contiguous along N, which the [O, K/32] storage is not.
+_MXFP8_TRITON_OPT_FLAGS = {
+    "is_persistent": False,
+    "num_warps": 8,
+    "block_k": 64,
+    "block_n": 128,
+}
+
+
 def mxfp8_gemm_backend_override() -> Optional[str]:
     """Return the fixed MXFP8 GEMM backend, or None to let the engine choose.
 
@@ -3603,10 +3618,14 @@ def flashinfer_mxfp8_decode_graph_capture() -> Iterator[None]:
 class MXFP8LinearMethod(LinearMethodBase):
     """MXFP8 weights (e4m3 + UE8M0 1x32) x dynamic MXFP8 activations (W8A8).
 
-    Three execution paths share a common loader:
+    Four execution paths share a common loader:
       - Reference (no CUTLASS op compiled): dequantize the weight to compute
         dtype and run F.linear. Slow but correct -- used to seed M1 tests and
         as a portable fallback.
+      - Triton (Hopper, BF16 activations, captured CUDA graphs up to 1024
+        tokens): the weight stays e4m3 and the vendored ``matmul`` upcasts each
+        tile with its 1x32 scales. It reads the reference [O,K/32] scale
+        layout, so the weight footprint matches the reference path.
       - CUTLASS (Blackwell sm100/103 + mxfp8_mxfp8_gemm op present): dynamic
         MXFP8 activation quantize + block-scaled e4m3xe4m3 GEMM.
       - FlashInfer: reuse the CUTLASS-layout activations, weights, and scales
@@ -3624,6 +3643,7 @@ class MXFP8LinearMethod(LinearMethodBase):
     CUTLASS configuration remains the cache-miss fallback.
     """
     BLOCK_SIZE = 32
+    _TRITON_MAX_TOKENS = 1024
     # Swizzled-SF layout padding (matches W4A8MXFP4FP8: rows->128, cols/SFblock->4).
     _SF_ROW_PAD = 128
     _SF_COL_PAD = 4
@@ -3632,6 +3652,7 @@ class MXFP8LinearMethod(LinearMethodBase):
         super().__init__()
         self.use_cutlass = _mxfp8_cutlass_op_available(
         ) or _mxfp8_flashinfer_only()
+        self.use_triton = not self.use_cutlass and _mxfp8_triton_supported()
         self.backend = mxfp8_gemm_backend_override() or "trtllm"
         # Only ModelEngine owns the startup tuning lifecycle. Keep
         # standalone modules and engine paths that skip warmup (for example,
@@ -3772,6 +3793,39 @@ class MXFP8LinearMethod(LinearMethodBase):
         else:
             module.register_parameter("bias", None)
 
+    def _runs_triton(self, input: torch.Tensor) -> bool:
+        """Whether this forward takes the Triton path.
+
+        Only captured CUDA graphs do: an eager ``matmul`` call costs about 0.4 ms
+        of host time, more than the dequantizing path on small or TP-split shapes.
+        Above ``_TRITON_MAX_TOKENS`` the per-tile upcast costs more than
+        dequantizing the weight once per call.
+        """
+        return (self.use_triton and input.dtype == torch.bfloat16
+                and input.shape[0] <= self._TRITON_MAX_TOKENS
+                and not is_torch_compiling()
+                and torch.cuda.is_current_stream_capturing())
+
+    def _triton_gemm(self, module: Linear, input: torch.Tensor) -> torch.Tensor:
+        """Multiply BF16 activations by the e4m3 weight and its 1x32 scales.
+
+        The (1, K, O) views keep K contiguous without copying the stored [O, K]
+        weight or [O, K/32] scale.
+        """
+        from triton_kernels.matmul import (FlexCtx, PrecisionConfig, matmul,
+                                           scoped_opt_flags_constraints)
+        precision_config = PrecisionConfig(
+            b_mx_scale=module.weight_scale.T.unsqueeze(0),
+            b_microblock_size=self.BLOCK_SIZE,
+            flex_ctx=FlexCtx(),
+            allow_tf32=False,
+            out_dtype=input.dtype)
+        with scoped_opt_flags_constraints(_MXFP8_TRITON_OPT_FLAGS):
+            return matmul(input,
+                          module.weight.T.unsqueeze(0),
+                          None,
+                          precision_config=precision_config)
+
     def apply(self, module: Linear, input: torch.Tensor,
               bias: Optional[torch.Tensor]):
         """Apply MXFP8 linear projection with eager or capture-safe dispatch."""
@@ -3822,6 +3876,10 @@ class MXFP8LinearMethod(LinearMethodBase):
                         module._mxfp8_alpha,
                         module.dtype,
                     )
+            if bias is not None:
+                output = output + bias
+        elif self._runs_triton(input):
+            output = self._triton_gemm(module, input)
             if bias is not None:
                 output = output + bias
         else:

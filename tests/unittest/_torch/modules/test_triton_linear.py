@@ -25,6 +25,8 @@ from utils.util import check_accuracy, skip_no_hopper
 
 import tensorrt_llm._torch.modules.triton_linear as triton_linear_module
 from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.mxfp8_utils import (dequant_mxfp8_weight,
+                                                     quant_bf16_to_mxfp8)
 from tensorrt_llm._torch.modules.triton_linear import TritonLinear
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
@@ -111,6 +113,79 @@ def test_linear_fp8qdq(linear_cls):
                    atol=0.01,
                    rtol=0.01,
                    percent=0.99)
+
+
+@skip_no_hopper
+@pytest.mark.parametrize(
+    ("num_tokens", "in_size", "out_size", "has_bias"),
+    [
+        (1, 6144, 9216, False),  # M3.1 fused qkv at TP1
+        (16, 3072, 6144, False),
+        (64, 6144, 256, True),
+        (1024, 256, 64, False),
+        (8, 96, 64, False),  # K not a multiple of block_k
+        (128, 64, 6144, False),
+    ],
+)
+def test_linear_mxfp8_triton_graph_matches_fp32(
+    num_tokens: int,
+    in_size: int,
+    out_size: int,
+    has_bias: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A captured Hopper forward reads the MXFP8 weight in place and matches FP32 to BF16 precision."""
+    dtype = torch.bfloat16
+    torch.manual_seed(0)
+    weight = torch.randn((out_size, in_size), dtype=torch.float32)
+    # Vary the exponent between 1x32 blocks, as real weights do.
+    exponents = torch.randint(-4,
+                              5, (out_size, in_size // 32),
+                              dtype=torch.float32)
+    weight *= torch.exp2(exponents).repeat_interleave(32, 1)
+    weight_e4m3, scale = quant_bf16_to_mxfp8(weight, 32)
+    bias = torch.randn((out_size, ), dtype=dtype) if has_bias else None
+    weights = {"weight": weight_e4m3, "weight_scale_inv": scale}
+    if has_bias:
+        weights["bias"] = bias
+
+    linear = Linear(
+        in_features=in_size,
+        out_features=out_size,
+        bias=has_bias,
+        dtype=dtype,
+        quant_config=QuantConfig(quant_algo=QuantAlgo.MXFP8, group_size=32),
+    ).cuda()
+    linear.load_weights([weights])
+
+    assert linear.quant_method.use_triton
+    assert linear.weight.dtype == torch.float8_e4m3fn
+    assert linear.weight_scale.shape == (out_size, in_size // 32)
+
+    x = torch.randn((num_tokens, in_size), dtype=dtype).cuda()
+    weight_fp32 = dequant_mxfp8_weight(weight_e4m3, scale, 32).float().cuda()
+    reference = x.float() @ weight_fp32.T
+    if has_bias:
+        reference += bias.float().cuda()
+
+    # Fail if the captured forward falls back to the dequantizing path.
+    def no_dequant(*args: object, **kwargs: object) -> None:
+        raise AssertionError("captured forward must not dequantize the weight")
+
+    monkeypatch.setattr(
+        "tensorrt_llm._torch.modules.mxfp8_utils.dequant_mxfp8_weight",
+        no_dequant)
+    graph = torch.cuda.CUDAGraph()
+    with torch.inference_mode():
+        with torch.cuda.graph(graph):
+            output = linear(x)
+        output.zero_()
+        graph.replay()
+        torch.cuda.synchronize()
+
+    assert output.dtype == dtype
+    relative_error = (output.float() - reference).norm() / reference.norm()
+    assert relative_error < 5e-3, f"relative error {relative_error}"
 
 
 @skip_no_hopper
